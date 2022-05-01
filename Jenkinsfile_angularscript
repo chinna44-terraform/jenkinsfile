@@ -1,0 +1,91 @@
+pipeline {
+    options {
+        ansiColor('xterm')
+        buildDiscarder logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '', numToKeepStr: '15')
+    }
+
+
+    parameters {
+      string defaultValue: 'develop', description: 'Bitbucket Repository Branch', name: 'UI_GitBranch', trim: false
+      string defaultValue: 'develop', description: 'Bitbucket Repository Branch', name: 'BE_GitBranch', trim: false
+      choice choices: ['aws', 'dev', 'qa', 'uat', 'prod'], description: 'Build Environment', name: 'ENVIRONMENT'
+    }
+    agent { label 'fargate-prod-jenkins-slave-nna-efs'}
+
+    environment {
+    ROLEARN = ""
+    FEREPO = "https://bitbucket.aws.na.nissancloud.biz/scm/apx0315/idms-admin-ui.git"
+    FEREPOBRANCH = "${UI_GitBranch}"
+    BuildEnv = "${ENVIRONMENT}"
+    }
+
+    stages {
+
+        stage('FE Checkout') {
+            steps {
+                script {
+                    git  branch: FEREPOBRANCH, url: FEREPO, credentialsId: 'BitBucket-Admin'
+                    currentBuild.displayName = "${BUILD_NUMBER}-${ENVIRONMENT}-${UI_GitBranch}"
+                }
+            }
+        } 
+
+        stage('PRE-BUILD') {
+            steps {
+                sh """
+                    set +x
+                    bash -c \" 
+                    echo '**************** NPM INSTALL ****************'; \
+                    export NVM_DIR="$HOME/.nvm"; \
+                    chmod +x "$NVM_DIR/nvm.sh"; \
+                    source $NVM_DIR/nvm.sh; \
+                    nvm install 12.13.1; \
+                    nvm source ; \
+                    npm -v ;  
+                    npm install --verbose ;
+                    \"
+                """
+            }
+        }
+        
+        stage('BUILD') {
+            steps {
+                sh """
+                    set +x
+                    bash -c \"
+                    echo '**************** NPM BUILD ****************'; \
+                    npm run build:${BuildEnv};
+                    \"
+                """
+            }
+
+        }
+        stage("PUSH ARRICFACTS TO Nexus") {
+            steps {
+                script {
+                    sh """
+                        set -x
+                        bash -c \"\
+                        sed -i 's/idms-admin-ui/idms-admin-ui-${BuildEnv}/g' package.json; \
+                        cat package.json; \
+                        cp -f package.json dist/; \
+                        tar -czf ${BuildEnv}-${BUILD_NUMBER}-dist.tgz dist; \
+                        npm publish ${BuildEnv}-${BUILD_NUMBER}-dist.tgz --verbose;
+                        \"
+                    """
+                }
+            } 
+        }
+        stage("Trigger BE Build") {
+            steps {
+                script {
+                    build job: "io-admin-web", \
+                        wait: false, \
+                        parameters: [[$class: 'StringParameterValue', name: 'BE_GitBranch', value: "${params.BE_GitBranch}"], \
+                                    [$class: 'StringParameterValue', name: 'ENV', value: "${params.ENVIRONMENT}"]
+                    ]
+                }
+            } 
+        }
+    }
+}
