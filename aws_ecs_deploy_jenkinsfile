@@ -1,0 +1,274 @@
+// triggered by a commit on the repository master branch
+
+def title(cmd) {
+    sh('#!/bin/sh -e\necho -e "\\e[1m\\e[34m' + cmd + '\\e[39m\\e[0m"')
+}
+
+def warn(cmd) {
+    sh('#!/bin/sh -e\necho -e "\\e[1m\\e[35m' + cmd + '\\e[39m\\e[0m"')
+}
+
+def result(cmd) {
+    sh('#!/bin/sh -e\necho -e "\\e[1m\\e[32m' + cmd + '\\e[39m\\e[0m"')
+}
+
+
+pipeline {
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '', numToKeepStr: '15')
+     	  disableConcurrentBuilds()
+    }
+
+    environment {
+      directory = "dataextractorprocessor"
+      infra = "dev"
+      registry = "https://690554025895.dkr.ecr.us-east-1.amazonaws.com"
+      traefik_domain = "extractor-gamma17.dev.nonprod.na.nissancloud.com"
+      imageName="gamma17/dataextractor"
+      imageTag = "latest"
+      REGION = "us-east-1"
+      serviceName = "gamma17-nna-dev-extractor"
+      ecs_cluster = "gamma17-nna-dev"
+
+      memory = "2048"
+      port = "8080"
+      count = "1"
+      ROLEARN = "arn:aws:iam::690554025895:role/Jenkins-Role-NNA-Prod"
+      taskRole = "arn:aws:iam::690554025895:role/gamma17-nna-dev-DataExtractor-TaskRole-us-east-1"
+      execRole = "arn:aws:iam::690554025895:role/gamma17-nna-dev-TaskExecutionRole-us-east-1"
+     // projectKey = "APX10409"
+      ecs_cluster_ContainerLog = "gamma17-nna-dev-ContainerLogs"
+      containerPath = "/gamma/efs"
+
+      //secret
+      kinesisProducerStreamName = "/application/gamma17-nna-dev/Extractor/KinesisProducerStreamName"
+      kinesisConsumerStreamName = "/application/gamma17-nna-dev/Extractor/KinesisConsumerStreamName"
+      gammaDexConsumer = "/application/gamma17-nna-dev/Extractor/GAMMA_DEX_CONSUMER"
+      //environment
+      efsAsyncWritePoolsize = "50"
+      gammaRegion = "NNA"
+      kplAggregationMaxCount = "200"
+      kplAggregationMaxSize = "1048576"
+      kplRecordMaxbufferedTime = "15000"
+      kplRecordttl = "120000"
+
+	  //Newparams
+      aSyncKinesisPoolSize = "20"
+	  gammaLoggingCallerData = "FALSE"
+      gammaLoggingLevel = "INFO"
+	  rulesDisable = "dex-cw-probe-ddi"
+
+      grcDatasourceUsername="databases/postgres/gammaodometer-dev-rw"
+	  grcDatasourceUrl="jdbc-secretsmanager:postgresql://gammaodometer-dev.cluster-ccjvyj2swlsj.us-east-1.rds.amazonaws.com/gammaodometerdev?currentSchema=grc"
+      btrDatasourceUsername="databases/postgres/gammaodometer-dev-rw"
+      btrDatasourceUrl="jdbc-secretsmanager:postgresql://gammaodometer-dev.cluster-ccjvyj2swlsj.us-east-1.rds.amazonaws.com/gammaodometerdev?currentSchema=btr"
+    }
+
+    agent { label 'fargate-prod-jenkins-slave-nna'}
+
+
+    stages {
+         stage('Clone Repo') {
+            steps {
+                script {
+                def scmVars = checkout([$class: 'GitSCM', branches: [[name: "${env.GIT_BRANCH}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CloneOption', noTags: false, reference: '', shallow: true]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "BitBucket-Admin", url: "${env.GIT_URL}"]]])
+                env.GIT_COMM = scmVars.GIT_COMMIT.substring(0, 8)
+                }
+            }
+        }
+        stage('Jenkins Shared Repo Checkout') {
+            steps {
+               echo 'Checking out shared scripts from Bit Bucket...'
+               dir('jenkins-shared') {
+                    git  branch: "master", url: "https://bitbucket.aws.na.nissancloud.biz/scm/dev/jenkins-libraries.git", credentialsId: 'BitBucket-Admin'
+                }
+            }
+        }
+
+         stage("CIS Scan") {
+            steps {
+                script {
+                    try {
+                        dir("dockerfile-scanner") {
+                            title "Check Dockerfile for CIS compliance"
+                            checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "BitBucket-Admin", url: '$DOCKERFILE_SCANNER_REPO']]])
+                           sh "python3 scanner.py ../${directory}/Dockerfile"
+                            env.tag = "m"
+                        }
+                    } catch(Exception error) {
+                        warn "WARN: Code quality tests failed!"
+                        currentBuild.result = "UNSTABLE"
+                        env.tag = "w"
+                    }
+                }
+            }
+        }
+
+        stage ("Build") {
+            steps{
+                echo '***** Lets grab the properties *****'
+                    echo 'CHANGE_ID ' + env.CHANGE_ID
+                    echo 'GIT_COMMIT ' + env.GIT_COMMIT
+                    echo 'GIT_BRANCH ' + env.GIT_BRANCH
+                    echo 'GIT_LOCAL_BRANCH ' + env.GIT_LOCAL_BRANCH
+                    echo 'GIT_PREVIOUS_COMMIT ' + env.GIT_PREVIOUS_COMMIT
+                    echo 'GIT_PREVIOUS_SUCCESSFUL_COMMIT ' + env.GIT_PREVIOUS_SUCCESSFUL_COMMIT
+                    echo 'GIT_URL ' + env.GIT_URL
+                    echo 'GIT_URL_N - ' + env.GIT_URL_N
+                    echo 'GIT_AUTHOR_NAME ' + env.GIT_AUTHOR_NAME
+                    echo 'CHANGE_AUTHOR ' + env.CHANGE_AUTHOR
+                    echo 'GIT_COMMITTER_EMAIL ' + env.GIT_COMMITTER_EMAIL
+                    echo env.TAG_NAME
+                    echo env.TAG_NAME_GIT_HASH
+
+                    title '**************** START - Build Maven pipeline ****************'
+                    withMaven(maven: 'Maven', mavenSettingsConfig: 'Gamma-Maven-Settings', tempBinDir: '') {
+                    sh "mvn --projects ${directory} --also-make clean package -Dmaven.test.skip=true"
+                    sh "ls -ltr ${directory}/target"
+                        }
+                    title '**************** END - Maven Build pipeline ****************'
+                }
+            }
+        stage('stash Artifact') {
+            steps {
+                title "***** Stash Artifact ******"
+                stash includes: "**/${directory}/target/*.jar", name: "${directory}"
+                    }
+                }
+        stage("Docker Phase") {
+
+            agent { label 'ec2-prod-jenkins-slave-nna'}
+
+                stages {
+
+                    stage('Jenkins Shared Repo Checkout') {
+                        steps {
+                        echo 'Checking out shared scripts from Bit Bucket...'
+                        dir('jenkins-shared') {
+                                git  branch: "master", url: "https://bitbucket.aws.na.nissancloud.biz/scm/dev/jenkins-libraries.git", credentialsId: 'BitBucket-Admin'
+                            }
+                        }
+                    }
+
+                    stage('Pull Artifacts') {
+                        steps {
+                            title "Unstash Artifact"
+                            unstash "${directory}"
+                            script {
+                                sh """
+                                cd ${directory}/target
+                                ls -ltr
+                                """
+                                }
+                        }
+                    }
+
+                    stage("Docker Image") {
+                        steps {
+                            title "Build and tag the Docker Image"
+                            script {
+                                dir("./${directory}") {
+                                sh "docker build -t ${imageName} -f Dockerfile ."
+                                }
+
+                            }
+                        }
+                    }
+
+      //Push Image to ECR
+                    stage("Push to Registry") {
+                        steps {
+                            script {
+                                title "Push the Docker image to the registry"
+                                sh """
+                                    set +x
+                                    echo 'Assuming Role ...'
+                                    source ${WORKSPACE}/jenkins-shared/scripts/ce/aws-assume-role.sh ${ROLEARN}
+                                    eval \$(aws ecr get-login --region $REGION --no-include-email)
+                                """
+                                docker.withRegistry(registry) {
+                                    docker.image(imageName).push("${env.tag}-${infra}-${env.GIT_COMM}")
+                                    //docker.image(imageName).push("${env.BUILD_NUMBER}")
+                                    docker.image(imageName).push('latest')
+                                }
+                                title "Remove untagged images from registry"
+                                sh """
+                                    set +x
+                                    echo 'Assuming Role ...'
+                                    source ${WORKSPACE}/jenkins-shared/scripts/ce/aws-assume-role.sh ${ROLEARN}
+                                    eval \$(aws ecr get-login --region $REGION --no-include-email)
+                                    aws ecr list-images --region $REGION --repository-name $imageName --filter tagStatus=UNTAGGED --query 'imageIds[*]' --output text | while read imageId; do aws ecr batch-delete-image --region $REGION --repository-name $imageName --image-ids imageDigest=\$imageId; done
+                                """
+                            }
+                        }
+                    }
+                    stage("Deploy to DEV") {
+                        steps {
+                            title "Update the Task Definition"
+                            sh '''
+                                echo 'Assuming Role ...'
+                                source ${WORKSPACE}/jenkins-shared/scripts/ce/aws-assume-role.sh ${ROLEARN}
+                                aws ecr get-login --region $REGION --no-include-email
+                                aws ecs register-task-definition \
+                                    --task-role-arn $taskRole \
+                                    --execution-role-arn $execRole \
+                                    --region $REGION \
+                                    --family "TD-$serviceName" \
+                                    --volumes "[{\\"host\\": {\\"sourcePath\\": \\"/gamma\\"}, \\"name\\": \\"efs_mount_point_id\\"}]" \
+                                     --container-definitions "[{\\"name\\": \\"$serviceName\\", \\"image\\": \\"\$(echo $registry | sed 's/https:\\/\\///')/$imageName:$imageTag\\", \\"essential\\": true, \\"mountPoints\\": [{\\"sourceVolume\\": \\"efs_mount_point_id\\", \\"containerPath\\": \\"$containerPath\\"}], \\"secrets\\": [{\\"name\\": \\"gamma.dex.kinesis.producer.stream\\", \\"valueFrom\\": \\"$kinesisProducerStreamName\\"}, {\\"name\\": \\"gamma.kinesis.application.name\\", \\"valueFrom\\": \\"$gammaDexConsumer\\"}, {\\"name\\": \\"gamma.kinesis.consumer.stream\\", \\"valueFrom\\": \\"$kinesisConsumerStreamName\\"}], \\"environment\\": [{\\"name\\": \\"aws.region\\", \\"value\\": \\"$REGION\\"}, {\\"name\\": \\"gamma.btr.enabled\\", \\"value\\": \\"true\\"}, {\\"name\\": \\"async.kinesis.pool.size\\", \\"value\\": \\"$aSyncKinesisPoolSize\\"}, {\\"name\\": \\"gamma.logging.caller-data\\", \\"value\\": \\"$gammaLoggingCallerData\\"}, {\\"name\\": \\"gamma.logging.level\\", \\"value\\": \\"$gammaLoggingLevel\\"}, {\\"name\\": \\"rules.disable\\", \\"value\\": \\"$rulesDisable\\"}, {\\"name\\": \\"efs.async.write.poolSize\\", \\"value\\": \\"$efsAsyncWritePoolsize\\"}, {\\"name\\": \\"gamma.region\\", \\"value\\": \\"$gammaRegion\\"}, {\\"name\\": \\"kpl.aggregation-max-count\\", \\"value\\": \\"$kplAggregationMaxCount\\"}, {\\"name\\": \\"kpl.aggregation-max-size\\", \\"value\\": \\"$kplAggregationMaxSize\\"}, {\\"name\\": \\"kpl.record-max-buffered-time\\", \\"value\\": \\"$kplRecordMaxbufferedTime\\"}, {\\"name\\": \\"kpl.record-ttl\\", \\"value\\": \\"$kplRecordttl\\"}, {\\"name\\": \\"gamma.data.extractor.jdbc.grc.datasource.username\\", \\"value\\": \\"$grcDatasourceUsername\\"},{\\"name\\": \\"gamma.data.extractor.jdbc.grc.datasource.jdbc-url\\", \\"value\\": \\"$grcDatasourceUrl\\"}, {\\"name\\": \\"gamma.data.extractor.jdbc.btr.datasource.username\\", \\"value\\": \\"$btrDatasourceUsername\\"},{\\"name\\": \\"gamma.data.extractor.jdbc.btr.datasource.jdbc-url\\", \\"value\\": \\"$btrDatasourceUrl\\"}], \\"portMappings\\": [{\\"containerPort\\": $port, \\"protocol\\": \\"tcp\\"}], \\"dockerLabels\\": {\\"traefik.frontend.rule\\": \\"Host:$traefik_domain\\", \\"traefik.enable\\": \\"true\\", \\"traefik.protocol\\": \\"http\\", \\"traefik.port\\": \\"$port\\"}, \\"logConfiguration\\": {\\"logDriver\\": \\"awslogs\\", \\"options\\": {\\"awslogs-create-group\\": \\"true\\", \\"awslogs-group\\": \\"$ecs_cluster_ContainerLog\\", \\"awslogs-region\\": \\"$REGION\\", \\"awslogs-stream-prefix\\": \\"$serviceName\\"}}}]" \
+                                    --memory $memory
+                            '''
+                            title "Update the Service and deploy"
+                            script {
+                                sh '''
+                        echo 'Assuming Role ...'
+                        source ${WORKSPACE}/jenkins-shared/scripts/ce/aws-assume-role.sh ${ROLEARN}
+                        aws ecs list-services --cluster $ecs_cluster --region $REGION --output text
+                        TASK_REVISION=\$(aws ecs describe-task-definition --region $REGION --task-definition "TD-"$serviceName | egrep "revision" | tr "/" " " | awk '{print \$2}' | sed 's/"\$//')
+                        echo $TASK_REVISION
+                        SERVICE_STATUS=\$(aws ecs list-services --cluster $ecs_cluster --region $REGION --output text)
+                        if echo $SERVICE_STATUS | grep -q $serviceName; then
+                                        aws ecs update-service \
+                                            --cluster $ecs_cluster \
+                                            --region $REGION \
+                                            --service $serviceName \
+                                            --task-definition 'TD-'$serviceName \
+                                            --force-new-deployment
+                                    else
+                                        aws ecs create-service \
+                                            --task-definition 'TD-'$serviceName \
+                                            --cluster $ecs_cluster \
+                                            --region $REGION \
+                                            --desired-count $count \
+                                            --service-name $serviceName \
+                                            --deployment-configuration minimumHealthyPercent=50 \
+                                            --launch-type EC2
+                                    fi;
+                                '''
+                            }
+
+                            result "Service available at https://${traefik_domain}"
+                        }
+                    }
+                  stage('Clear Images') {
+                      steps {
+                      title "Clear App Images from ec2 ecs jenkins"
+                          //sh "docker images --filter \"dangling=true\" -q --no-trunc | xargs -r docker rmi --force"
+                          sh "docker images --format '{{.Repository}}:{{.Tag}}' | grep '$imageName' | xargs -r docker rmi --force"
+
+                          }
+                      }
+                    }
+                  }
+               }
+    post {
+        failure {
+        emailext attachLog: true, compressLog: false,
+        body: "${currentBuild.currentResult}: Job ${env.JOB_NAME} build number - ${env.BUILD_NUMBER} More info at: ${env.BUILD_URL}",
+        recipientProviders: [[$class: 'RequesterRecipientProvider'],  [$class: 'DevelopersRecipientProvider'], [$class: 'CulpritsRecipientProvider']],
+        subject: "Jenkins Build ${currentBuild.currentResult}: Job ${env.JOB_NAME}"
+            }
+        }
+}
