@@ -1,0 +1,152 @@
+#!/usr/bin/env groovy
+
+pipeline {
+	agent none
+	options {
+        timeout(time: 12, unit: 'HOURS')
+    }
+	stages {
+		stage('Build') {
+			agent {
+				docker {
+					image 'adoptopenjdk/maven-openjdk11'
+					label 'dind'
+					args '-v /root/.m2:/root/.m2'
+				}
+			}
+			steps {
+				checkout scm
+                withCredentials([usernamePassword(credentialsId: 'pce-artifactory', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+                    sh 'mvn -s settings.xml clean install -Dmaven.test.skip=true'
+                }
+				stash includes: 'target/*.war', name: 'artifact'
+			}
+		}
+		stage('Unit tests') {
+			agent { 
+				docker {
+					image 'adoptopenjdk/maven-openjdk11'
+					label 'dind'
+					args '-v /root/.m2:/root/.m2'
+				} 
+			}
+			steps {
+				checkout scm
+				withCredentials([usernamePassword(credentialsId: 'pce-artifactory2', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+					sh 'mvn -B -s settings.xml -Dmaven.test.failure.ignore test'
+					sh 'mvn -B -s settings.xml surefire-report:report-only'
+				}
+			}
+		}
+		stage('Publish artifact') {
+			agent {
+                docker {
+                    image 'adoptopenjdk/maven-openjdk11'
+                    label 'dind'
+                    args '-v /root/.m2:/root/.m2'
+                }
+			}
+			steps {
+				script {
+					echo 'Publishing Artifacts to Artifactory'
+					unstash 'artifact'
+
+                    withCredentials([usernamePassword(credentialsId: 'pce-artifactory', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+                        sh 'mvn -s settings.xml deploy -Dmaven.test.skip=true -DrepositoryId=pce-central -Dfile=target/*.jar'
+                    }
+				}
+			}
+		}
+		stage('SonarQube scan') {
+			agent {
+				docker {
+					image 'adoptopenjdk/maven-openjdk11'
+					label 'dind'
+					args '-v /root/.m2:/root/.m2'
+				}
+			}
+			steps {
+				checkout scm
+				withSonarQubeEnv('pce_sonarqube_server') {
+					// requires SonarQube Scanner for Maven 3.2+
+                    withCredentials([usernamePassword(credentialsId: 'pce-artifactory', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+										  sh 'export MAVEN_OPTS="-Xmx4g"; mvn -s settings.xml clean org.jacoco:jacoco-maven-plugin:0.8.6:prepare-agent install -Dmaven.test.failure.ignore'
+										  sh 'export MAVEN_OPTS="-Xmx4g"; mvn sonar:sonar'
+                    }
+				}
+			}
+		}
+				stage('Coverity scan') {
+			agent {
+				docker {
+					image 'registry.gear.ge.com/212591399/coverity-java-11:1.0.4'
+					label 'dind'
+				}
+			}
+			steps {
+				checkout scm
+				withCredentials([usernamePassword(credentialsId: 'pce-artifactory', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+               // configFileProvider([configFile(fileId: 'pce-artifactory', variable: 'MAVEN_SETTINGS')]){
+                    sh 'rm -rf /tmp/covtemp'
+                    sh 'java -version '
+                    sh 'mkdir -p /tmp/covtemp'
+                    sh 'cov-build --dir /tmp/covtemp mvn -s settings.xml clean package -Dmaven.test.skip=true'     
+            
+                }  
+				sh 'cov-analyze --dir /tmp/covtemp '				
+				withCredentials([usernamePassword(credentialsId: 'coverity_user', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                    sh "cov-commit-defects --dir /tmp/covtemp --host coverity.power.ge.com --https-port 443 --stream '1000562954_pci_feedback_service' --user $USERNAME --password $PASSWORD"
+                }
+			}
+			post {
+				success {
+				  echo 'Coverity scan is completed.'
+				  emailext (
+					subject: "DevSecOps Coverity Scan Completed",
+					mimeType: "text/html",
+					body: "Please login to https://coverity.power.ge.com/ to access the scan results",
+					to: "fatih.kaygisiz@ge.com"
+				  )
+				}
+				failure {
+				  echo "There was an error in Coverity Scan"
+				  emailext (
+					subject: "DevSecOps Coverity Scan Failed",
+					mimeType: "text/html",
+					body: "Please check the console for more details: ${env.BUILD_URL}console",
+					to: "fatih.kaygisiz@ge.com"
+				  )
+				}
+			  }  
+		}
+		
+		/*
+		stage('Coverity scan') {
+						
+			agent {
+				docker {
+					image 'registry.gear.ge.com/212730346/pwr_pce_coverity'
+					label 'dind'
+					customWorkspace '/home/jenkins/workspace'
+				}
+			}
+			when {
+				beforeAgent true
+				branch 'dev'
+			}
+			steps {
+				checkout scm
+				sh 'nproc'
+				withCredentials([usernamePassword(credentialsId: 'pce-artifactory', usernameVariable: 'PCE_USERNAME', passwordVariable: 'PCE_PASSWORD')]) {
+					sh 'cov-build --dir=/home/jenkins/coverity-idir mvn -s settings.xml  clean install -Dmaven.test.skip=true'
+				}				
+				sh 'cov-analyze --dir=/home/jenkins/coverity-idir -sf /home/jenkins/PWR_cov_license.dat -j 8 --webapp-security --allow-unmerged-emits'
+				sh 'cov-commit-defects -sf /home/jenkins/PWR_cov_license.dat --auth-key-file=/home/jenkins/PWR_cov_auth_key_file.COM-8443 --dir=/home/jenkins/coverity-idir --host=coverity.power.ge.com --port 443 --ssl --stream="1000562954_pci_feedback_service" --description="${BUILD_TAG}" --noxrefs --on-new-cert trust'
+			}
+			
+		}
+		*/
+		
+		
+	}
+}
