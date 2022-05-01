@@ -1,0 +1,149 @@
+def ENV
+def BE_GitBranch
+def title(cmd) {
+      sh('#!/bin/sh -e\necho -e "\\e[1m\\e[34m' + cmd + '\\e[39m\\e[0m" ')
+}
+
+def warn(cmd) {
+      sh('#!/bin/sh -e\necho -e "\\e[1m\\e[35m' + cmd + '\\e[39m\\e[0m" ')
+}
+
+properties([
+      parameters([
+      string(defaultValue: 'develop', description: 'Bitbucket Repository Branch', name: 'GitBranch', trim: false)
+      choice(choices: ['aws', 'dev', 'qa', 'uat', 'prod'], description: 'Build Environment', name: 'ENVIRONMENT')
+      ])
+])
+
+if ( "$params.BE_GitBranch".trim()) {
+      if ( "$params.BE_GitBranch" != "null") {
+            GitBranch = "${params.BE_GitBranch}"
+            echo "BE Current Branch Is:: $GitBranch"
+      }
+}
+
+if ( "$params.ENV".trim() ) {
+      if ( "$params.ENV" != "null") {
+            ENVIRONMENT = "${params.ENV}"
+            echo "Environment is:: $ENVIRONEMNT"
+      }
+}
+
+pipeline {
+
+      options {
+          ansiColor('xterm')
+          buildDiscarder logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysTokeepStr: '', numTokeepStr: '15')
+      }
+      
+      environment {
+          ROLEARN = "arn:aws:iam::<aws_acc_id>:role/Jenkins-Role-NML"
+          jenkinsCredentialsForBucket = "BitBucket-Admin"
+          BEREPO = "https://bitbucket.aws.na.nissancloud.biz/scm/apx0315/idms-admin-web.git"
+          BEREPOBRANCH = "${GitBranch}"
+      }
+
+      agent { label 'fargate-prod-jenkins-slave-nna-efs'}
+      
+      stages {
+          stage('Git Checkout') {
+              steps {
+                  script {
+                      git branch: BEREPOBRANCH, url: BEREPO, credentialsId: 'BitBucket-Admin'
+                      currentBuild.displayName = "${BUILD_NUMBER}-${ENVIRONMENT}-${GitBranch}"
+                  }
+              }
+          }  
+          
+          stage('Integrate FE Artifact') {
+              steps {
+                  withCredentials([usernamePassword(credentailsId: 'iDMNENMLNexus', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                      sh """
+                          curl --insecure  --fail --show-error -v -u $user:$pass --output dist.tgz https://nexus.aws.na.nissancloud.biz/repository/APX0315-npm-hosted/idms-admin-ui-${ENVIRONMENT}/-/idms-admin-ui-${ENVIRONMENT}-1.0.0.tgz
+                          tar -xzf dist.tgz
+                          ls -l
+                          mkdir -p ./src/main/resource/static
+                          cp -rf dist/idms-admin-ui/* ./src/main/resource/static
+                          ls ./src/main/resource/static
+                         rm -rf dist dist.tgz
+                      """
+                  }
+              }
+          }
+          
+          stage("BE Build") {
+              steps {
+                  withMaven(maven: 'Maven', mavenSettingsConfig: 'IDMS-NE-NML-Maven-SettingsXML', tempBinDir: '') {
+                      sh "mvn clean verify"
+                      sh "du -sch target/*"                  
+                  }              
+              }
+
+          }
+ 
+
+          stage('Publish BE Artifact')
+              steps {
+                  script {
+                      withCredentials([usernamePassword(credentialsId: 'iDMSNENMLNexus', passowrdVariable: 'pass', usernameVariable: 'user')]) {
+                          sh """
+                              mv target/idms-admin.war target/idms-admin-0.1.war
+                              curl --insecure --fail -show-error -v -u $user:$pass --upload target/idms-admin-0.1.war https://nexus.aws.na.nissancloud.biz/repository/APX3015-maven-hosted/${ENVIRONMENT}/idms-admin/0.1/
+                          """
+                      }
+                  }
+              }
+
+          stage("Deployment-Phase") {
+              agent { label 'prod-windows-ec2-slave' }
+              stages {
+                  stage("Nexus-Download") {
+                      steps {
+                          withCredentials([usernamePassword(credentialsId: 'iDMSNENMLNexus', passwordVariable: 'PASS', usernameVariable: 'USER')]) {
+                              script {
+                                  bat """ 
+                                      curl --insecure --fail --show-error -v -u "%USER%":"%PASS%" --output "idms-admin-${ENVIRONMENT}.war" "https://nexus.aws.na.nissancloud.biz/repository/APX0315-maven-hosted/${ENVIRONMENT}/idms-admin/0.1/idms-admin-0.1.war"
+                                      dir
+                                  """
+                              }
+                          }
+                      }                           
+                  }
+              }
+          }
+
+          stage("SSH PUBLISH") {
+              steps {
+                 script{
+                     if ( "$ENVIRONMENT" == "prod" ) {
+                         echo "Copying artifacts to prod server"
+                         sshPublisher(
+                             publishers: [
+                                 sshPublisherDesc(
+                                     configName: 'IDMSPROD', transfers: [sshTransfer(cleanRemote: false, excludes: '',
+                                         execCommand: """
+                                             ls -ltr DeploymentFiles
+                                         """,
+                                         execTimeout: 120000, flatten: false, makeEmptyDirs: false, noDefaultExcludes: false, patternSeparator: '[, ]+', remoteDirectory: '/DeploymentFiles', remoteDrectorySDF: false, removeprefix: '', sourceFiles: "idms-admin-${ENVIRONMENT}.war")], usePromotionTimestamp: false, useworkspaceInPromotion: false, verbose: false                                
+                                 )
+                             ]
+                         )  
+                     else {
+                         sshPublisher(
+                             publishers: [
+                                 sshPublisherDesc(
+                                     configName: 'IDMSQA', transfers: [sshTransfer(cleanRemote: false, excludes: '',
+                                         execCommand: """
+                                             sudo /usr/local/bin/ansible-playbook \\
+                                             -i /root/ansible/hosts \\
+                                             /root/ansible/idms-admin-deployments/${ENVIRONMENT}-deploy-admin.yml""",
+                                         execTimeout: 120000, flatten: false, makeEmptyDirs: false, noDefaultExcludes: false, patternSeparator: '[, ]+',                        
+                                 )
+                             ]
+                         )
+                     }
+                 }
+              }
+          }
+      }
+}
